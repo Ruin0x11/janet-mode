@@ -28,6 +28,7 @@
 (require 'inf-lisp)
 (require 'lisp-mode)
 (require 'prog-mode)
+(require 'eval-sexp-fu nil t)
 
 
 ;;; Customization
@@ -245,17 +246,71 @@ Open Janet buffer if not open."
     (pop-to-buffer inferior-lisp-buffer nil t))
   )
 
+(defun janet-doc-for (sym)
+  (let ((doc (janet-repl-send-string-no-output (format "(doc %s)" sym))))
+    (when (not (string-match-p "^symbol \\(.*\\) not found\\." doc)) doc)))
+
 (defun janet-show-doc (sym)
-  )
+  (let* ((doc (janet-doc-for sym))
+         (buffer (get-buffer-create "*janet-doc*"))
+         (inhibit-read-only t))
+    (if doc
+        (progn
+          (with-help-window buffer
+            (unless (zerop (length doc))
+              (princ doc)))
+          (with-current-buffer buffer
+            (save-excursion
+              (goto-char (point-max))
+              (previous-line)
+              (beginning-of-line)
+              (kill-line)
+              (goto-char (point-min)))))
+      (message "No documentation for '%s'." (strip-text-properties sym)))))
 
 (defun janet-doc (arg)
   "Run `doc' for the method at point."
-  (interactive)
+  (interactive "P")
   (let ((thing (thing-at-point 'symbol)))
     (janet-show-doc
      (if (or (not thing) arg)
          (read-string "Symbol: ")
        thing))))
+
+(defun janet--fnsym-in-current-sexp ()
+  "Return a list of current function name and argument index."
+  (save-excursion
+    ;; HACK: uses elisp for now.
+    (let ((argument-index (1- (elisp--beginning-of-sexp))))
+      ;; If we are at the beginning of function name, this will be -1.
+      (when (< argument-index 0)
+	(setq argument-index 0))
+      ;; Don't do anything if current word is inside a string.
+      (if (= (or (char-after (1- (point))) 0) ?\")
+	  nil
+	(list (thing-at-point 'symbol) argument-index)))))
+
+(defun janet-eldoc ()
+  (when (janet-repl-get-process)
+    (if-let ((fnsym (janet--fnsym-in-current-sexp))
+             (doc (janet-doc-for (car fnsym))))
+        (let* ((split (split-string doc "\n"))
+               (type (string-trim (nth 2 split)))
+               (loc (string-trim (nth 3 split)))
+               (has-loc (not (string-blank-p loc)))
+               (sig (string-trim (or (and has-loc (nth 5 split)) (nth 4 split))))
+               (fontified-sig (with-temp-buffer
+                                (insert sig)
+                                (delay-mode-hooks (janet-mode))
+                                (font-lock-default-function 'janet-mode)
+                                (font-lock-default-fontify-region (point-min)
+                                                                  (point-max)
+                                                                  nil)
+                                (buffer-string)))
+               (rest (seq-drop split (or (and has-loc 6) 5)))
+               (summary (mapconcat 'string-trim (seq-take rest (- (length rest) 3)) "\n"))
+               (msg (format "%s\n%s" fontified-sig (concat (when has-loc (concat loc "\n")) summary))))
+          (substring msg 0 (min 500 (length msg)))))))
 
 
 ;;; janet-mode setup
@@ -288,7 +343,7 @@ Open Janet buffer if not open."
     (define-key map "\C-c\C-z" 'switch-to-lisp)
                                         ; (define-key janet-mode-map "\C-c\C-l" 'lisp-load-file)
                                         ; (define-key janet-mode-map "\C-c\C-a" 'lisp-show-arglist)
-    (define-key map "\C-c\C-d" 'lisp-describe-sym)
+    (define-key map "\C-c\C-d" 'janet-doc)
     (define-key map "\C-c\C-f" 'lisp-show-function-documentation)
     (define-key map "\C-c\C-v" 'lisp-show-variable-documentation)
     map))
@@ -359,6 +414,28 @@ Inherits from `emacs-lisp-mode-syntax-table'.")
    OUTPUT is a string with the contents of the buffer"
   (ansi-color-filter-apply output))
 
+(defun janet--bounds-of-last-sexp ()
+  (cons (save-excursion
+          (backward-sexp)
+          (point))
+        (point)))
+
+(defun janet--bounds-of-last-defun ()
+  (save-excursion
+    (end-of-defun)
+    (skip-chars-backward " \t\n\r\f") ;  Makes allegro happy
+    (let ((end (point)) (case-fold-search t))
+      (beginning-of-defun)
+      (cons (point) end))))
+
+(defun janet-mode-eval-sexp-fu-setup ()
+  "Set up `janet-mode' with `eval-sexp-fu'."
+
+  (define-eval-sexp-fu-flash-command lisp-eval-last-sexp
+    (eval-sexp-fu-flash (janet--bounds-of-last-sexp)))
+  (define-eval-sexp-fu-flash-command lisp-eval-defun
+    (eval-sexp-fu-flash (janet--bounds-of-last-defun))))
+
 (defun janet-mode-hooks ()
   ;; `electric-layout-post-self-insert-function' prevents indentation in strings
   ;; and comments, force indentation in docstrings:
@@ -368,7 +445,12 @@ Inherits from `emacs-lisp-mode-syntax-table'.")
   (make-local-variable 'comint-output-filter-functions)
   (add-hook 'comint-output-filter-functions
             'janet-comint-output-filter-function)
-  )
+  (if (null eldoc-documentation-function)
+      ;; Emacs<25
+      (set (make-local-variable 'eldoc-documentation-function)
+           #'janet-eldoc)
+    (add-function :before-until (local 'eldoc-documentation-function)
+                  #'janet-eldoc)))
 
 ;;;###autoload
 (define-derived-mode janet-mode prog-mode "Janet"
@@ -377,7 +459,9 @@ Inherits from `emacs-lisp-mode-syntax-table'.")
 \\{janet-mode-map}"
   (janet-mode-variables)
   (janet-font-lock-setup)
-  (janet-mode-hooks))
+  (janet-mode-hooks)
+  (when (not (null eval-sexp-fu-flash-mode))
+    (janet-mode-eval-sexp-fu-setup)))
 
 
 ;;; Janet fill-function
@@ -444,7 +528,7 @@ If JUSTIFY is non-nil, justify as well as fill the paragraph."
 
 (defun janet--search-comment-macro-internal (limit)
   "Search for a comment forward stopping at LIMIT."
-  (when (search-forward-regexp janet-comment-macro-regexp limit t)
+  (when (search-forward-regexp janet--comment-macro-regexp limit t)
     (let* ((md (match-data))
            (start (match-beginning 1))
            (state (syntax-ppss start)))
